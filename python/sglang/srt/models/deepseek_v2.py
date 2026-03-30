@@ -1203,6 +1203,10 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                         )
                     else:
                         self.next_skip_topk = False
+        else:
+            # For non-NSA models, initialize these attributes to False
+            self.skip_topk = False
+            self.next_skip_topk = False
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
