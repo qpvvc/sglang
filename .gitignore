@@ -271,3 +271,5 @@ sgl-kernel/csrc/**/*_musa/
 
 # MUSA core dump files
 *.mudmp
+test/test_results
+test_results
