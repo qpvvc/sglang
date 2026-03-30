@@ -735,6 +735,15 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         return hidden_states
 
+    def set_eagle3_layers_to_capture(self, layer_ids=None):
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        self.language_model.set_embed_and_head(embed, head)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
         mapper = getattr(self, "hf_to_sglang_mapper", None)
