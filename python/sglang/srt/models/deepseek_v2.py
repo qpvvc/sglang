@@ -4101,6 +4101,12 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
+def handle_attention_torch_native(attn, forward_batch):
+    # torch_native backend always uses MLA absorbed path to avoid dimension
+    # mismatch between MHA-format query and MLA-format KV cache.
+    return _dispatch_mla_subtype(attn, forward_batch)
+
+
 AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
 AttentionBackendRegistry.register("fa3", handle_attention_fa3)
@@ -4111,6 +4117,7 @@ AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
 AttentionBackendRegistry.register("aiter", handle_attention_aiter)
 AttentionBackendRegistry.register("nsa", handle_attention_nsa)
 AttentionBackendRegistry.register("triton", handle_attention_triton)
+AttentionBackendRegistry.register("torch_native", handle_attention_torch_native)
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
