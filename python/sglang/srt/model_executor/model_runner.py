@@ -868,6 +868,13 @@ class ModelRunner:
                 self.tp_rank,
                 self.pp_rank,
             )
+            
+        # Hook-based precision comparison (MUSA vs A100 etc.)
+        from sglang.srt.debug_utils.precision_compare import PrecisionDebugger
+
+        _precision_debugger = PrecisionDebugger.from_env()
+        if _precision_debugger is not None:
+            _precision_debugger.attach(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(
