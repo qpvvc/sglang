@@ -1291,13 +1291,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:
+            IS_NEOX_STYLE=os.getenv("SGLANG_IS_NEOX_STYLE", "false").lower() == "true"
             self.rotary_emb = get_rope_wrapper(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
                 max_position=max_position_embeddings,
                 base=rope_theta,
                 rope_scaling=rope_scaling,
-                is_neox_style=False,
+                is_neox_style=IS_NEOX_STYLE,
                 device=get_global_server_args().device,
             )
 
