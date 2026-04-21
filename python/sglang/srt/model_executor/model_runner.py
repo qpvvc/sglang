@@ -2697,6 +2697,19 @@ class ModelRunner:
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
 
+        # Notify precision debugger of current forward phase (prefill / decode)
+        try:
+            from sglang.srt.debug_utils.precision_compare import set_forward_phase
+            if forward_batch.forward_mode.is_decode():
+                set_forward_phase("decode")
+            elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True) or \
+                    forward_batch.forward_mode.is_split_prefill():
+                set_forward_phase("prefill")
+            else:
+                set_forward_phase(None)
+        except ImportError:
+            pass
+
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,

@@ -42,6 +42,25 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Module-level phase tracking
+# Set by model_runner.py before each forward call so hooks can filter by phase.
+# Values: "prefill" | "decode" | None (unknown)
+# ---------------------------------------------------------------------------
+_current_forward_phase: Optional[str] = None
+
+
+def set_forward_phase(phase: str) -> None:
+    """Set the current forward phase. Called by model_runner before each forward."""
+    global _current_forward_phase
+    _current_forward_phase = phase
+
+
+def get_forward_phase() -> Optional[str]:
+    """Return the current forward phase (prefill / decode / None)."""
+    return _current_forward_phase
+
+
 DEFAULT_METHOD_WRAPS = [
     "layer_communicator.prepare_attn",
     "layer_communicator.prepare_mlp",
@@ -205,8 +224,13 @@ class PrecisionDebugger:
         min_tokens: int = 100,
         align_input: bool = False,
         leaf_only: bool = True,
+        required_phase: str = "any",
     ):
         assert mode in ("capture", "compare"), f"Invalid mode: {mode}"
+        assert required_phase in ("prefill", "decode", "any"), (
+            f"Invalid SGLANG_PRECISION_PHASE: {required_phase!r}. "
+            "Must be 'prefill', 'decode', or 'any'."
+        )
         self.mode = mode
         self.save_dir = Path(save_dir)
         self.ref_dir = Path(ref_dir) if ref_dir else None
@@ -215,6 +239,7 @@ class PrecisionDebugger:
         self.min_tokens = min_tokens
         self.align_input = align_input
         self.leaf_only = leaf_only
+        self.required_phase = required_phase
         self._saved: Set[str] = set()
         self._pre_clone: Dict[str, Any] = {}  # key → list of CPU tensor clones (pre-forward)
         self._rank: Optional[int] = None
@@ -249,6 +274,14 @@ class PrecisionDebugger:
         if methods_str:
             method_wraps = [s.strip() for s in methods_str.split(",") if s.strip()]
 
+        required_phase = os.environ.get("SGLANG_PRECISION_PHASE", "any").strip().lower()
+        if required_phase not in ("prefill", "decode", "any"):
+            logger.warning(
+                f"[PrecisionDebugger] Invalid SGLANG_PRECISION_PHASE={required_phase!r}, "
+                "falling back to 'any'"
+            )
+            required_phase = "any"
+
         return cls(
             mode=mode,
             save_dir=save_dir,
@@ -258,6 +291,7 @@ class PrecisionDebugger:
             min_tokens=min_tokens,
             align_input=align_input,
             leaf_only=leaf_only,
+            required_phase=required_phase,
         )
 
     def _get_rank(self) -> int:
@@ -322,7 +356,14 @@ class PrecisionDebugger:
     def _should_trigger(self, first_tensor: Optional[torch.Tensor]) -> bool:
         if first_tensor is None:
             return False
-        return first_tensor.shape[0] >= self.min_tokens
+        if first_tensor.shape[0] < self.min_tokens:
+            return False
+        # Phase filter: only trigger in the specified forward phase
+        if self.required_phase != "any":
+            current = get_forward_phase()
+            if current != self.required_phase:
+                return False
+        return True
 
     def _save_tensors(self, key: str, input_data, output_data):
         """Save input and output tensors to disk (once per key).
