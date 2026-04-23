@@ -121,15 +121,61 @@ def _replace_all_float_tensors(args, ref_tensors: list, device, dtype):
     return tuple(new_args)
 
 
+def _normalize_ref_tensors(ref_input) -> list:
+    """Normalize saved reference inputs to a flat list of tensors.
+
+    Saved inputs may come from older single-tensor captures or newer list/tuple captures.
+    """
+    if isinstance(ref_input, torch.Tensor):
+        return [ref_input]
+    if isinstance(ref_input, (tuple, list)):
+        return [t for t in ref_input if isinstance(t, torch.Tensor)]
+    return []
+
+
 def _safe_name(module_path: str) -> str:
     """Convert dotted module path to a filesystem-safe name."""
     return module_path.replace(".", "_")
 
 
+def _describe_structure(value) -> str:
+    """Describe nested output structure for debugging/reporting."""
+    if isinstance(value, torch.Tensor):
+        return f"Tensor(shape={tuple(value.shape)},dtype={value.dtype})"
+    if isinstance(value, list):
+        return "list[" + ", ".join(_describe_structure(v) for v in value) + "]"
+    if isinstance(value, tuple):
+        return "tuple(" + ", ".join(_describe_structure(v) for v in value) + ")"
+    if isinstance(value, dict):
+        items = ", ".join(f"{k}:{_describe_structure(v)}" for k, v in value.items())
+        return "dict{" + items + "}"
+    if value is None:
+        return "None"
+    return type(value).__name__
+
+
+def _extract_tensor_sequence(value) -> List[torch.Tensor]:
+    """Extract tensors from a top-level tensor / tuple / list for per-output comparison."""
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, (tuple, list)):
+        return [item for item in value if isinstance(item, torch.Tensor)]
+    return []
+
+
+def _add_prefixed_metrics(dst: Dict[str, float], prefix: str, metrics: Dict[str, float]) -> None:
+    for key, value in metrics.items():
+        dst[f"{prefix}_{key}"] = value
+
+
 def _compute_metrics(a: torch.Tensor, b: torch.Tensor) -> Dict[str, float]:
     """Compute comparison metrics between two tensors."""
     if a.shape != b.shape:
-        return {"error": "shape_mismatch", "a_shape": str(a.shape), "b_shape": str(b.shape)}
+        if a.numel() == b.numel():
+            # Same total elements, different layout (e.g. [N,H,D] vs [N,H*D]) – reshape a to b's shape.
+            a = a.reshape(b.shape)
+        else:
+            return {"error": "shape_mismatch", "a_shape": str(a.shape), "b_shape": str(b.shape)}
     a_f = a.float()
     b_f = b.float()
     diff = (a_f - b_f).abs()
@@ -426,7 +472,10 @@ class PrecisionDebugger:
         if actual_weights is None or ref_weights is None:
             return
 
-        all_metrics: Dict[str, float] = {}
+        all_metrics: Dict[str, float] = {
+            "output_structure_actual": _describe_structure(output_tuple),
+            "output_structure_ref": _describe_structure(ref_tuple),
+        }
 
         # Raw (order-sensitive) weight comparison
         raw_metrics = _compute_metrics(actual_weights, ref_weights)
@@ -464,36 +513,51 @@ class PrecisionDebugger:
             logger.warning(f"[PrecisionDebugger] No reference output for: {key}")
             return
 
-        output_cpu = _to_cpu(output_tensor)
-        if output_cpu is None:
+        full_output_cpu = _to_cpu(output_tensor)
+        if full_output_cpu is None:
             return
+
+        # Compare mode should also preserve the complete runtime output structure on disk,
+        # while metrics for non-TopK outputs continue to use the first tensor by default.
+        torch.save(full_output_cpu, str(self.save_dir / f"{key}_output.pt"))
 
         # TopK output: sort by expert ids before comparing weights, also compare ids.
         if (
             _is_topk_key(key)
-            and isinstance(output_cpu, (tuple, list))
-            and len(output_cpu) >= 2
+            and isinstance(full_output_cpu, (tuple, list))
+            and len(full_output_cpu) >= 2
             and isinstance(ref_output, (tuple, list))
             and len(ref_output) >= 2
         ):
-            torch.save(output_cpu, str(self.save_dir / f"{key}_output.pt"))
-            self._compare_topk_output(key, output_cpu, ref_output)
+            self._compare_topk_output(key, full_output_cpu, ref_output)
             return
 
-        # Handle tuple/list outputs (default: take first element)
-        if isinstance(output_cpu, (tuple, list)):
-            output_cpu = output_cpu[0] if output_cpu else None
-        if isinstance(ref_output, (tuple, list)):
-            ref_output = ref_output[0] if ref_output else None
-
-        if not isinstance(output_cpu, torch.Tensor) or not isinstance(ref_output, torch.Tensor):
+        actual_tensors = _extract_tensor_sequence(full_output_cpu)
+        ref_tensors = _extract_tensor_sequence(ref_output)
+        if not actual_tensors or not ref_tensors:
             return
 
-        metrics = _compute_metrics(output_cpu, ref_output)
+        metrics: Dict[str, float] = {
+            "output_structure_actual": _describe_structure(full_output_cpu),
+            "output_structure_ref": _describe_structure(ref_output),
+            "num_output_tensors_actual": len(actual_tensors),
+            "num_output_tensors_ref": len(ref_tensors),
+        }
+
+        comparable_count = min(len(actual_tensors), len(ref_tensors))
+        for idx in range(comparable_count):
+            indexed_metrics = _compute_metrics(actual_tensors[idx], ref_tensors[idx])
+            _add_prefixed_metrics(metrics, f"output_{idx}", indexed_metrics)
+            if idx == 0:
+                metrics.update(indexed_metrics)
+
+        if len(actual_tensors) != len(ref_tensors):
+            metrics["output_count_mismatch"] = (
+                f"actual={len(actual_tensors)},ref={len(ref_tensors)}"
+            )
+
         logger.info(f"[PrecisionDebugger] Compare {key}: {metrics}")
 
-        # Save output and metrics for offline analysis
-        torch.save(output_cpu, str(self.save_dir / f"{key}_output.pt"))
         metrics_path = self.save_dir / f"{key}_metrics.txt"
         with open(str(metrics_path), "w") as f:
             for k, v in metrics.items():
@@ -528,11 +592,7 @@ class PrecisionDebugger:
                 if debugger.mode == "compare" and debugger.align_input:
                     ref_input = debugger._load_ref(key, "input")
                     if ref_input is not None and first_t is not None:
-                        # Normalize old format (single tensor) to list
-                        if isinstance(ref_input, torch.Tensor):
-                            ref_input = [ref_input]
-                        elif isinstance(ref_input, (tuple, list)):
-                            ref_input = [t for t in ref_input if isinstance(t, torch.Tensor)]
+                        ref_input = _normalize_ref_tensors(ref_input)
                         return _replace_all_float_tensors(
                             args, ref_input, first_t.device, first_t.dtype
                         )
@@ -588,11 +648,7 @@ class PrecisionDebugger:
                 if debugger.mode == "compare" and debugger.align_input:
                     ref_input = debugger._load_ref(trace_key, "input")
                     if ref_input is not None and first_t is not None:
-                        # Normalize old format (single tensor) to list
-                        if isinstance(ref_input, torch.Tensor):
-                            ref_input = [ref_input]
-                        elif isinstance(ref_input, (tuple, list)):
-                            ref_input = [t for t in ref_input if isinstance(t, torch.Tensor)]
+                        ref_input = _normalize_ref_tensors(ref_input)
                         args = _replace_all_float_tensors(
                             args, ref_input, first_t.device, first_t.dtype
                         )
